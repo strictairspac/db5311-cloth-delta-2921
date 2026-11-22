@@ -25,12 +25,12 @@ def work():
             if not job:
                 cache.brpop('worker:wake', timeout=1)
                 continue
-            run_id, token, payload = job
+            run_id, token, payload, decisions = job['run_id'], job['token'], job['payload'], job['decisions']
             stop = Event()
             thread = Thread(target=heartbeat, args=(stop,), daemon=True)
             thread.start()
             try:
-                result = solve(payload, engine)
+                result = solve(payload, engine, decisions)
                 finish(run_id, token, result=result)
             except (ValueError, KeyError, TypeError) as exc:
                 finish(run_id, token, error=str(exc)[:500])

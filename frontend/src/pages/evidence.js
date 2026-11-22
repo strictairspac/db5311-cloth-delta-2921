@@ -10,13 +10,36 @@ export function evidencePage(state, identity) {
   const {report} = current;
   const metrics = Object.entries(report.metrics).map(([label,value])=>`<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join('');
   const sections = report.sections.map(x=>panel(x.title, entries(x.rows))).join('');
+  const caseId = state.runs.find(row=>row.id===current.run_id)?.case_id;
+  const conflict = report.conflict ? conflictBoard(state, current, report.conflict, caseId) : '';
+  const decided = (state.decisions || []).filter(row=>row.case_id===caseId);
+  const ledger = decided.length ? panel('历次取舍（配额单可查）', records(
+    ['流水行','批次','修订号','取舍','裁决人','裁决时间','重算执行'],
+    decided.map(row=>[esc(row.line), esc(row.batch_id), esc(row.revision),
+      esc(row.choice==='stored'?'先登记':'本次收件'), esc(row.actor), esc(date(row.created_at)),
+      row.run_id?`<a href="#runs/${row.run_id}">执行 ${row.run_id}</a>`:esc('—')]))) : '';
   const review = current.reviewer ? `<p data-testid="reviewed">${esc(current.reviewer)} · ${esc(date(current.reviewed_at))}</p><p>${esc(current.review_note)}</p>`
     : state.session.role==='reviewer'?'<form id="review-form"><label>复核意见<textarea name="note" maxlength="500" required></textarea></label><button>签署复核</button></form>'
     : '<p class="note">待复核员签署</p>';
   const history = state.evidence.map(row=>[`<a href="#evidence/${row.id}">执行 ${row.run_id}</a>`, esc(row.report.summary), esc(row.reviewer || '待复核')]);
   return `${heading(topic.modules[3], report.summary, `<button id="download" data-id="${current.id}">导出证据</button>`)}
     <div class="spread evidence-top"><dl class="metrics">${metrics}</dl><aside class="brief"><h2>复核签署</h2>${review}<details><summary>结果校验码</summary><code class="digest">${esc(current.digest)}</code></details></aside></div>
-    ${sections}<details><summary>历史证据</summary>${records(['执行','结论','复核'], history)}</details>`;
+    ${conflict}${ledger}${sections}<details><summary>历史证据</summary>${records(['执行','结论','复核'], history)}</details>`;
+}
+
+function conflictBoard(state, current, conflict, caseId) {
+  const canDecide = state.session.role==='reviewer';
+  const readings = Object.entries(conflict.readings).map(([label, row])=>[
+    esc(label), esc(row['等级']), esc(row['重量（克）']), esc(row['件数']), `<code class="digest">${esc(conflict.digests[label])}</code>`]);
+  const prior = (state.decisions || []).filter(row=>row.case_id===caseId && row.line!==conflict['流水行']);
+  const buttons = conflict.choices.map(x=>
+    `<button type="button" class="decision" data-choice="${esc(x.choice)}" data-evidence="${current.id}" ${canDecide?'':'disabled'}>采用${esc(x.label)}</button>`).join('');
+  const history = prior.length ? panel('历次裁决', records(['流水行','批次','修订号','取舍','裁决人','裁决时间'],
+    prior.map(row=>[esc(row.line), esc(row.batch_id), esc(row.revision), esc(row.choice==='stored'?'先登记':'本次收件'), esc(row.actor), esc(date(row.created_at))]))) : '';
+  return panel(`待裁决版本冲突 · 第 ${conflict['流水行']} 行`,
+    `${records(['读数来源','等级','重量（克）','件数','校验码'], readings)}
+     <p class="note">选定后按原收件顺序重算；落选读数不入账。若还有冲突，会停在下一处，已选定的读数继续有效。</p>
+     ${canDecide?`<div class="actions decision-actions">${buttons}</div>`:'<p class="note">待复核员选定读数。</p>'}${history}`);
 }
 
 export function bindEvidence(api, update, fail) {
@@ -38,4 +61,18 @@ export function bindEvidence(api, update, fail) {
     await api(`/evidence/${identity}/review`, {method:'POST', data:{note:data.get('note')}});
     await update();
   }, fail);
+  document.querySelectorAll('button.decision').forEach(button=>{
+    button.addEventListener('click', async()=>{
+      const choice = button.dataset.choice;
+      document.querySelectorAll('button.decision').forEach(x=>{x.disabled=true;});
+      try {
+        const result = await api(`/evidence/${identity}/decisions`, {method:'POST', data:{choice}});
+        if (result.run_id) window.location.hash = `runs/${result.run_id}`;
+        else await update();
+      } catch (error) {
+        await update();
+        fail(error);
+      }
+    });
+  });
 }

@@ -1,13 +1,21 @@
 """纬回布库 donation stock, revision evidence and warehouse quota decisions."""
 
+import hashlib
 from collections import Counter
 
 from src.services import cloth_stock
 from src.services.cloth_quota import warehouse_plan
+from src.utils.encoding import canonical
 
 
 BOOK = '记账'
 CANCEL = '撤销'
+READING_KEYS = ('batch_id', 'revision', 'action', 'grade', 'weight_g', 'pieces')
+CHOICE_LABELS = {'stored': '先登记', 'incoming': '本次收件'}
+_CHOICES = {
+    'stored': 'stored', '先登记': 'stored', '先到': 'stored', 'first': 'stored', 'keep': 'stored',
+    'incoming': 'incoming', '本次收件': 'incoming', '后到': 'incoming', 'later': 'incoming', 'replace': 'incoming',
+}
 SPEC = {
     'name': '纬回布库·捐布分级汇总',
     'summary': '复核修订后的捐布等级库存，判断各等级仓位余量并列出超额时建议转裁的批次。',
@@ -119,41 +127,181 @@ def _audit_row(index, event, status, retracted, added):
     return row
 
 
-def _conflict_report(index, event, stored, audit):
-    identity = f"{event['batch_id']} 第 {event['revision']} 版"
+def reading(row):
+    """Normalise a receipt or opening row to the six fields that make up a version."""
+    return {key: row.get(key, BOOK if key == 'action' else None) for key in READING_KEYS}
+
+
+def reading_digest(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def choice_of(value):
+    """Accept either machine choices or the Chinese labels shown to reviewers."""
+    key = value.strip() if isinstance(value, str) else value
+    if key not in _CHOICES:
+        raise ValueError('裁决须选择「先登记」或「本次收件」')
+    return _CHOICES[key]
+
+
+def _decision_view(item):
+    decision = item['decision']
     return {
-        'summary': f'{identity}出现不同内容，暂停本次仓位与转裁发单。',
-        'metrics': {'版本冲突数': 1, '首个冲突流水行': index},
-        'sections': [
-            {'title': '版本冲突', 'rows': [
-                {'来源': source, '批次': row['batch_id'], '修订号': row['revision'], '动作': row['action'],
-                 '等级': row['grade'], '重量（克）': row['weight_g'], '件数': row['pieces']}
-                for source, row in [('先登记', stored), ('本次收件', event)]
-            ]},
-            {'title': '冲突前修订轨迹', 'rows': audit},
-        ],
+        '流水行': item['index'], '批次': item['event']['batch_id'], '修订号': item['event']['revision'],
+        '取舍': CHOICE_LABELS[decision['choice']],
+        '先登记等级': item['stored']['grade'], '先登记重量（克）': item['stored']['weight_g'],
+        '先登记件数': item['stored']['pieces'],
+        '本次收件等级': item['event']['grade'], '本次收件重量（克）': item['event']['weight_g'],
+        '本次收件件数': item['event']['pieces'],
+        '裁决人': decision.get('actor') or '', '裁决时间': decision.get('created_at') or '',
     }
 
 
-def solve(payload, engine):
+def _decision_section(decisions):
+    return {'title': '历次裁决', 'rows': [_decision_view(item) for item in decisions]}
+
+
+def _plan(payload, decisions):
+    """Decide which receipt line gets posted before any stock is touched.
+
+    A reviewer choice keeps the losing reading out of the ledger, including
+    later receipt lines carrying the same losing reading. The first receipt
+    line that still differs from the established reading with no decision is
+    the next conflict. Returns postings, skipped lines, the conflict, the
+    decisions actually honoured and opening identities a choice replaced.
+    """
+    established = {}
+    opening_identity = {}
+    rejected = {}
+    posted = {}
+    plan = {}
+    losers = set()
+    overrides = set()
+    honoured = []
+
+    for row in payload['opening_batches']:
+        event = reading({**row, 'action': BOOK})
+        identity = (event['batch_id'], event['revision'])
+        established.setdefault(identity, event)
+        opening_identity.setdefault(identity, event)
+        posted.setdefault(identity, [])
+
+    conflict = None
+    for index, event in enumerate(payload['revisions'], 1):
+        event = reading(event)
+        identity = (event['batch_id'], event['revision'])
+        stored = established.get(identity)
+        decision = decisions.get(index)
+        if decision is not None:
+            if (stored is None or decision.get('stored_reading') != stored
+                    or decision.get('incoming_reading') != event):
+                raise ValueError(f'第 {index} 行裁决与档案当前内容不一致')
+            if choice_of(decision['choice']) == 'stored':
+                rejected.setdefault(identity, set()).add(reading_digest(event))
+                losers.add(index)
+            else:
+                if stored is not None:
+                    rejected.setdefault(identity, set()).add(reading_digest(stored))
+                    for prior in posted.get(identity, []):
+                        if plan.get(prior) != event:
+                            losers.add(prior)
+                    posted[identity] = [line for line in posted.get(identity, []) if plan.get(line) == event]
+                if identity in opening_identity:
+                    overrides.add(identity)
+                plan[index] = event
+                established[identity] = event
+                posted.setdefault(identity, []).append(index)
+            honoured.append({'index': index, 'event': event, 'stored': stored,
+                             'decision': {**decision, 'choice': choice_of(decision['choice'])}})
+            continue
+
+        if stored is None:
+            plan[index] = event
+            established[identity] = event
+            posted.setdefault(identity, []).append(index)
+        elif reading_digest(event) in rejected.get(identity, set()):
+            losers.add(index)
+        elif event != stored:
+            conflict = {'line': index, 'stored': stored, 'incoming': event}
+            break
+        else:
+            plan[index] = event
+            posted[identity].append(index)
+    return plan, losers, conflict, honoured, overrides
+
+
+def _conflict_report(index, event, stored, audit, decisions=()):
+    identity = f"{event['batch_id']} 第 {event['revision']} 版"
+    stored, event = reading(stored), reading(event)
+    sections = [
+        {'title': '版本冲突', 'rows': [
+            {'来源': source, '批次': row['batch_id'], '修订号': row['revision'], '动作': row['action'],
+             '等级': row['grade'], '重量（克）': row['weight_g'], '件数': row['pieces']}
+            for source, row in [(CHOICE_LABELS['stored'], stored), (CHOICE_LABELS['incoming'], event)]
+        ]},
+        {'title': '冲突前修订轨迹', 'rows': audit},
+    ]
+    if decisions:
+        sections.append(_decision_section(decisions))
+    return {
+        'summary': f'{identity}出现不同内容，暂停本次仓位与转裁发单。',
+        'metrics': {'版本冲突数': 1, '首个冲突流水行': index},
+        'sections': sections,
+        'conflict': {
+            '流水行': index, '批次': event['batch_id'], '修订号': event['revision'],
+            'readings': {CHOICE_LABELS['stored']: stored, CHOICE_LABELS['incoming']: event},
+            'digests': {CHOICE_LABELS['stored']: reading_digest(stored),
+                        CHOICE_LABELS['incoming']: reading_digest(event)},
+            'choices': [{'choice': 'stored', 'label': CHOICE_LABELS['stored']},
+                        {'choice': 'incoming', 'label': CHOICE_LABELS['incoming']}],
+        },
+    }
+
+
+def next_conflict(payload, decisions=None):
+    """The first receipt line still awaiting a decision for this payload."""
+    _, _, conflict, _, _ = _plan(payload, decisions or {})
+    return conflict
+
+
+def solve(payload, engine, decisions=None):
     validate(payload)
+    decisions = decisions or {}
+    plan, losers, conflict, honoured, overrides = _plan(payload, decisions)
     audit = []
     counts = Counter()
     with engine.begin() as conn:
         cloth_stock.initialize(conn)
         for row in payload['opening_batches']:
-            cloth_stock.apply_revision(conn, {**row, 'action': BOOK})
+            event = reading({**row, 'action': BOOK})
+            if (event['batch_id'], event['revision']) in overrides:
+                # A later receipt reading won this identity; the opening row is the loser.
+                counts['落选'] += 1
+                continue
+            cloth_stock.apply_revision(conn, event)
         for index, event in enumerate(payload['revisions'], 1):
-            status, retracted, added = cloth_stock.apply_revision(conn, event)
+            if conflict is not None and index >= conflict['line']:
+                break
+            if index in losers:
+                counts['落选'] += 1
+                audit.append(_audit_row(index, reading(event), '落选', None, None))
+                continue
+            # An incoming reading chosen for an opening identity must not be
+            # rejected by the registered opening row; post it as the version.
+            status, retracted, added = cloth_stock.apply_revision(conn, plan[index])
             if status == '版本冲突':
-                return _conflict_report(index, event, retracted, audit)
+                return _conflict_report(index, plan[index], retracted, audit, honoured)
             counts[status] += 1
-            audit.append(_audit_row(index, event, status, retracted, added))
+            audit.append(_audit_row(index, plan[index], status, retracted, added))
+        if conflict is not None:
+            return _conflict_report(conflict['line'], conflict['incoming'], conflict['stored'], audit,
+                                    [item for item in honoured if item['index'] < conflict['line']])
 
         reconciled = conn.execute(cloth_stock.RECONCILE).mappings().all()
         differences = sum(row['differs'] for row in reconciled)
         metrics = {
             '生效修订数': counts['生效'], '重复修订数': counts['重复'], '过期修订数': counts['过期'],
+            '落选读数行数': counts['落选'],
             '核对库存等级数': len(reconciled), '库存差异等级数': differences,
         }
         sections = [
@@ -170,13 +318,16 @@ def solve(payload, engine):
                     'metrics': metrics, 'sections': sections}
         active_batches = conn.execute(cloth_stock.ACTIVE_BATCHES).mappings().all()
 
-    decisions, cuts, missing_quotas = warehouse_plan(reconciled, active_batches, payload['quotas'])
+    decisions_taken, cuts, missing_quotas = warehouse_plan(reconciled, active_batches, payload['quotas'])
     metrics.update({'建议转裁批次数': len(cuts), '缺少配额等级数': missing_quotas})
     sections[1:1] = [
-        {'title': '分级仓位配额单', 'rows': decisions},
+        {'title': '分级仓位配额单', 'rows': decisions_taken},
         {'title': '建议转裁批次', 'rows': cuts},
     ]
+    if honoured:
+        sections.append(_decision_section([item for item in honoured]))
     summary = f'库存全量对账一致，建议转裁 {len(cuts)} 批。'
     if missing_quotas:
         summary += f'{missing_quotas} 个等级缺少配额，暂停这些等级发单。'
     return {'summary': summary, 'metrics': metrics, 'sections': sections}
+
